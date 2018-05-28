@@ -25,4 +25,4 @@ clean:
 	rm -f lex.yy.cpp y.tab.cpp y.tab.h  *.o *.exe 
 
 run: 
-	./$(OUTPUT_FILENAME) <test.rust
+	./$(OUTPUT_FILENAME) <example.rust

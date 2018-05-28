@@ -5,12 +5,16 @@
     #include<stdlib.h>
     #include<string.h>
     using namespace std;
+	FILE *javacode;
     #define Trace(t) printf(t)
     typedef  struct {									// declare the symbol table type and its member;
 		string name;
-		int thestate; //0:constant 1:variable
-		int array_or_not; //0:not array 1:array
-		int thetype; //0:int 1:float 2:char 3:string 4:bool
+		string function_content;     // for function_invoke's name and argument type
+		int is_global; 				// 0:local 1:global
+		int stackindex; 			// the symbol in stack number
+		int thestate; 				// 0:constant 1:variable
+		int array_or_not; 			// 0:not array 1:array
+		int thetype; 				// 0:int 1:float 2:char 3:string 4:bool
 		int array_count;
 			int theint;
 			float thefloat;
@@ -24,16 +28,26 @@
 	typedef struct{
 		string name;
 		int thetype;
+		int stackindex;
 	}symargu;
-	symargu *argu;
+	symtab *argu;
 	int totalargu = 0;
     symtab *thetab[256];
     symtab funtab[256];
     int idcount[256]={0};
     int functioncount = 0;
+	int functionstatetype = 5;
     int tabcount = 0;
 	int statecount =0;
-    void createtab(int tabcount);
+	int stackcount = 0;
+	int label_stack[100];   // for the situation has many if-else whiles,so i must save the next else's or outside label
+	int label_top = 1;      // the label_stack pointer,points the stack top,the top-1 is the newest label
+	int label_counter = 0;  // the total label
+	int is_const = 0;       // avoid declare const print ipush
+	int is_local = 0;		// avoid declare global variable print ipush
+    string temp_content="";    // the temp for the function content
+	void createtab(int tabcount);
+	symtab returnsymbol(char *id);
     void dump(int tabcount);
 	void argudump();
 	void functiondump();
@@ -45,6 +59,7 @@
     int returntype(int tabcount,char *id);
 	int return_constant_or_variable(int tabcount,char *id);
     int returnfunctiontype(char *id);
+	symtab returnfunctiontable(char *id);
     int insertcheck(int tabcount,char *id);
     void insertvalue(int tabcount,char *id,int temp);
     void insertvalue(int tabcount,char *id,float temp);
@@ -117,7 +132,7 @@ scopecontent:	declarations scopecontent			{Trace("< declarations scopecontent re
 			|	%empty								{Trace("< empty reduce to scopecontent >\n");}
 			;
 block:	'{'							{statecount = 0;tabcount++;createtab(tabcount);}
-		scopecontent '}'			{if(statecount==0)yyerror("no statement error");cout<<endl;dump(tabcount);tabcount--; Trace("<'{' scopecontent '}' reduce to block >\n");}
+		scopecontent			{cout<<endl;dump(tabcount);tabcount--; Trace("<'{' scopecontent '}' reduce to block >\n");}
 		;
 statement: NAME '=' expression ';'													// the simple statement ex: a = 10; reduce to statement;
 		{
@@ -125,7 +140,14 @@ statement: NAME '=' expression ';'													// the simple statement ex: a = 1
 			if(insertcheck(tabcount,$1.stringval)==1)
 			{
 				if($3.tokentype==0&&returntype(tabcount,$1.stringval)==0)
+				{
 					insertvalue(tabcount,$1.stringval,$3.intval);
+					symtab tempsym = returnsymbol($1.stringval);
+					if(tempsym.is_global==1)
+						fprintf(javacode,"\t\tputstatic int proj3.%s\n",$1.stringval);
+					else
+						fprintf(javacode,"\t\tistore %d\n",tempsym.stackindex);
+				}
 				else if($3.tokentype==1&&returntype(tabcount,$1.stringval)==0)
 				{
 					int x = $3.floatval;
@@ -146,7 +168,14 @@ statement: NAME '=' expression ';'													// the simple statement ex: a = 1
 				else if($3.tokentype==3&&returntype(tabcount,$1.stringval)==3)
 					insertvalue(tabcount,$1.stringval,$3.stringval);
 				else if($3.tokentype==4&&returntype(tabcount,$1.stringval)==4)
+				{
 					insertvalue(tabcount,$1.stringval,$3.boolval);
+					symtab tempsym = returnsymbol($1.stringval);
+					if(tempsym.is_global==1)
+						fprintf(javacode,"\t\tputstatic int proj3.%s\n",$1.stringval);
+					else
+						fprintf(javacode,"\t\tistore %d\n",tempsym.stackindex);
+				}
 				else
 					yyerror("assign error");
 				Trace("< NAME '=' expression reduce to statement >\n");
@@ -167,6 +196,18 @@ statement: NAME '=' expression ';'													// the simple statement ex: a = 1
 					insertvalue(tabcount,$1.stringval,$3.boolval);
 				else
 					yyerror("assign error");
+				symtab tempsym = returnsymbol($1.stringval);
+				if(tempsym.is_global==1)
+				{
+					if(tempsym.thetype==0)
+						fprintf(javacode,"\t\tputstatic int proj3.%s\n",tempsym.name.c_str());
+					else if(tempsym.thetype==4)
+						fprintf(javacode,"\t\tputstatic bool proj3.%s\n",tempsym.name.c_str());
+				}
+				else
+				{
+					fprintf(javacode,"\t\tistore %d\n",tempsym.stackindex);
+				}
 				Trace("< NAME '=' function_return reduce to statement >\n");
 			}
 		}
@@ -201,37 +242,39 @@ statement: NAME '=' expression ';'													// the simple statement ex: a = 1
 		}
 		|  if_statement         {statecount = 1;Trace("< if_statement reduce to statement >\n");}		// the simple statement if ex: if(a==10) { reduce to statement;
 		|  loop_statement       {statecount = 1;Trace("< loop_statement reduce to statement >\n");}	// the simple statement loop ex: while(a==10) { reduce to statement;
-		|  PRINT expression ';'							// the simple statement print ex: print "Hello world"; reduece to statement;
+		|  PRINT 
 		{
-			statecount = 1;
-			if($2.tokentype==0)
-				printf("%d",$2.intval);
-			else if($2.tokentype==1)
-				printf("%f",$2.floatval);
-			else if($2.tokentype==3)
-				printf("%s",$2.stringval);
-			else if($2.tokentype==4)
-				printf("%s",$2.boolval==true?"TRUE":"FALSE");
-			else
-					yyerror("print error");
-			Trace("< PRINT expression reduce to statement >\n");
+			fprintf(javacode,"\t\tgetstatic java.io.PrintStream java.lang.System.out\n");
 		}
-		|  PRINT '(' expression ')' ';'					// the simple statement ex: print ("Hello world"); reduce to statement;
+		   print_content	{Trace("< PRINT expression reduce to statement >\n");}
+		|  PRINTLN 
+		{
+			fprintf(javacode,"\t\tgetstatic java.io.PrintStream java.lang.System.out\n");
+		}
+		   '(' expression ')' ';'				// the simple statement ex: println ("Hello world"); reduce to statement;
 		{
 			statecount = 1;
-			if($3.tokentype==0)
-				printf("%d",$3.intval);
-			else if($3.tokentype==1)
-				printf("%f",$3.floatval);
-			else if($3.tokentype==3)
-				printf("%s",$3.stringval);
-			else if($3.tokentype==4)
-				printf("%s",$3.boolval==true?"TRUE":"FALSE");
+			if($4.tokentype==0)
+				printf("%d\n",$4.intval);
+			else if($4.tokentype==1)
+				printf("%f\n",$4.floatval);
+			else if($4.tokentype==3)
+				printf("%s\n",$4.stringval);
+			else if($4.tokentype==4)
+				printf("%s\n",$4.boolval==true?"TRUE":"FALSE");
 			else
-				yyerror("print error");
+				yyerror("println error");
+			if($4.tokentype==0||$4.tokentype==4)
+				fprintf(javacode,"\t\tinvokevirtual void java.io.PrintStream.println(int)\n");
+			else
+				fprintf(javacode,"\t\tinvokevirtual void java.io.PrintStream.println(java.lang.String)\n");
 			Trace("< PRINT '(' expression ')' reduce to statement >\n");
 		}
-		|  PRINTLN '(' expression ')' ';'				// the simple statement ex: println ("Hello world"); reduce to statement;
+		|  PRINTLN 
+		{
+			fprintf(javacode,"\t\tgetstatic java.io.PrintStream java.lang.System.out\n");
+		}
+		   expression ';'						// the simple statement ex: println "Hello world"; reduce to statement;
 		{
 			statecount = 1;
 			if($3.tokentype==0)
@@ -244,71 +287,100 @@ statement: NAME '=' expression ';'													// the simple statement ex: a = 1
 				printf("%s\n",$3.boolval==true?"TRUE":"FALSE");
 			else
 				yyerror("println error");
-			Trace("< PRINT '(' expression ')' reduce to statement >\n");
-		}
-		|  PRINTLN expression ';'						// the simple statement ex: println "Hello world"; reduce to statement;
-		{
-			statecount = 1;
-			if($2.tokentype==0)
-				printf("%d\n",$2.intval);
-			else if($2.tokentype==1)
-				printf("%f\n",$2.floatval);
-			else if($2.tokentype==3)
-				printf("%s\n",$2.stringval);
-			else if($2.tokentype==4)
-				printf("%s\n",$2.boolval==true?"TRUE":"FALSE");
+			if($3.tokentype==0||$3.tokentype==4)
+				fprintf(javacode,"\t\tinvokevirtual void java.io.PrintStream.println(int)\n");
 			else
-				yyerror("println error");
+				fprintf(javacode,"\t\tinvokevirtual void java.io.PrintStream.println(java.lang.String)\n");
 			Trace("< PRINTLN expression reduce to statement >\n");
 		}
-		|  return ';'   {statecount = 1;Trace("< return reduce to statement >\n");}		// the simple statement ex: return a; reduce to statement;
 		//|  lscope statement      {statecount=0;Trace("< lscope reduce to statement >\n");}		// the simple statement lscope ex: { reduce to statement;
 		//|  rscope       {if(statecount==0)yyerror("no statement error");Trace("< rscope reduce to statement >\n");}		// the simple statement rscope ex: } reduce to statement;
 		;
-constant: LET NAME '=' expression						// the declare constant ex: let a = 10 reduce to constant;
+print_content: expression ';'
+			  {
+				statecount = 1;
+				if($1.tokentype==0)
+					printf("%d",$1.intval);
+				else if($1.tokentype==1)
+					printf("%f",$1.floatval);
+				else if($1.tokentype==3)
+					printf("%s",$1.stringval);
+				else if($1.tokentype==4)
+					printf("%s",$1.boolval==true?"TRUE":"FALSE");
+				else
+					yyerror("print error");
+				if($1.tokentype==0||$1.tokentype==4)
+					fprintf(javacode,"\t\tinvokevirtual void java.io.PrintStream.print(int)\n");
+				else
+					fprintf(javacode,"\t\tinvokevirtual void java.io.PrintStream.print(java.lang.String)\n");
+			  }
+			|  '(' expression ')' ';'
+			  {
+				statecount = 1;
+				if($2.tokentype==0)
+					printf("%d",$2.intval);
+				else if($2.tokentype==1)
+					printf("%f",$2.floatval);
+				else if($2.tokentype==3)
+					printf("%s",$2.stringval);
+				else if($2.tokentype==4)
+					printf("%s",$2.boolval==true?"TRUE":"FALSE");
+				else
+					yyerror("print error");
+				if($2.tokentype==0||$2.tokentype==4)
+					fprintf(javacode,"\t\tinvokevirtual void java.io.PrintStream.print(int)\n");
+				else
+					fprintf(javacode,"\t\tinvokevirtual void java.io.PrintStream.print(java.lang.String)\n");
+			  }
+			;
+constant: LET NAME '='		{is_const=1;} 
+		  expression						// the declare constant ex: let a = 10 reduce to constant;
 		{
 			insert(tabcount,$2.stringval,0,0);
-			if($4.tokentype==0)
+			if($5.tokentype==0)
 			{
-				insertvalue(tabcount,$2.stringval,$4.intval);
+				insertvalue(tabcount,$2.stringval,$5.intval);
 			}
-			else if($4.tokentype==1)
+			else if($5.tokentype==1)
 			{
-				insertvalue(tabcount,$2.stringval,$4.floatval);
+				insertvalue(tabcount,$2.stringval,$5.floatval);
 			}
-			else if($4.tokentype==3)
+			else if($5.tokentype==3)
 			{
-				insertvalue(tabcount,$2.stringval,$4.stringval);
+				insertvalue(tabcount,$2.stringval,$5.stringval);
 			}
-			else if($4.tokentype==4)
+			else if($5.tokentype==4)
 			{
-				insertvalue(tabcount,$2.stringval,$4.boolval);
+				insertvalue(tabcount,$2.stringval,$5.boolval);
 			}
 			else
 				yyerror("assign error");
+			is_const=0;
 			Trace("< LET NAME '=' expression reduece to constant >\n");
 		}
-		| LET NAME ':' Type '=' expression				// the declare constant ex: let a : int = 10 reduce to constant;
+		| LET NAME ':' Type '='   {is_const = 1;} 
+		expression				// the declare constant ex: let a : int = 10 reduce to constant;
 		{
 			insert(tabcount,$2.stringval,$4.tokentype,0,0);
 			if($4.tokentype==0)
 			{
-				insertvalue(tabcount,$2.stringval,$6.intval);
+				insertvalue(tabcount,$2.stringval,$7.intval);
 			}
 			else if($4.tokentype==1)
 			{
-				insertvalue(tabcount,$2.stringval,$6.floatval);
+				insertvalue(tabcount,$2.stringval,$7.floatval);
 			}
 			else if($4.tokentype==3)
 			{
-				insertvalue(tabcount,$2.stringval,$6.stringval);
+				insertvalue(tabcount,$2.stringval,$7.stringval);
 			}
 			else if($4.tokentype==4)
 			{
-				insertvalue(tabcount,$2.stringval,$6.boolval);
+				insertvalue(tabcount,$2.stringval,$7.boolval);
 			}
 			else
 				yyerror("assign error");
+			is_const = 0;
 			Trace("< LET NAME ':' Type '=' expression reduce to constant >\n");
 		}
 		;
@@ -318,6 +390,13 @@ variable: LET MUT NAME '=' expression					// the declare variable ex: let mut a 
 			if($5.tokentype==0)
 			{
 				insertvalue(tabcount,$3.stringval,$5.intval);
+				if(tabcount==0)
+					fprintf(javacode,"\tfield static int %s = %d\n",$3.stringval,$5.intval);
+				else
+				{
+					symtab tempsym = returnsymbol($3.stringval);
+					fprintf(javacode,"\t\tistore %d\n",tempsym.stackindex);
+				}
 			}
 			else if($5.tokentype==1)
 			{
@@ -330,11 +409,17 @@ variable: LET MUT NAME '=' expression					// the declare variable ex: let mut a 
 			else if($5.tokentype==4)
 			{
 				insertvalue(tabcount,$3.stringval,$5.boolval);
+				if(tabcount==0)
+					fprintf(javacode,"\tfield static bool %s = %d\n",$3.stringval,$5.boolval);
+				else
+				{
+					symtab tempsym = returnsymbol($3.stringval);
+					fprintf(javacode,"\t\tistore %d\n",tempsym.stackindex);
+				}
 			}
 			else
 				yyerror("assign error");
 			Trace("< LET MUT NAME '=' expression reduce to variable >\n");
-
 		}
 		| LET MUT NAME ':' Type '=' expression			// the declare variable ex: let mut a : int = 10 reduce to variable;
 		{
@@ -342,6 +427,13 @@ variable: LET MUT NAME '=' expression					// the declare variable ex: let mut a 
 			if($5.tokentype==0)
 			{
 				insertvalue(tabcount,$3.stringval,$7.intval);
+				if(tabcount==0)
+					fprintf(javacode,"\tfield static int %s = %d\n",$3.stringval,$7.intval);
+				else
+				{
+					symtab tempsym = returnsymbol($3.stringval);
+					fprintf(javacode,"\t\tistore %d\n",tempsym.stackindex);
+				}
 			}
 			else if($5.tokentype==1)
 			{
@@ -354,6 +446,13 @@ variable: LET MUT NAME '=' expression					// the declare variable ex: let mut a 
 			else if($5.tokentype==4)
 			{
 				insertvalue(tabcount,$3.stringval,$7.boolval);
+				if(tabcount==0)
+					fprintf(javacode,"\tfield static bool %s = %d\n",$3.stringval,$7.boolval);
+				else
+				{
+					symtab tempsym = returnsymbol($3.stringval);
+					fprintf(javacode,"\t\tistore %d\n",tempsym.stackindex);
+				}
 			}
 			else
 				yyerror("assign error");
@@ -362,11 +461,20 @@ variable: LET MUT NAME '=' expression					// the declare variable ex: let mut a 
 		| LET MUT NAME									// the declare variable ex: let mut a reduce to variable;
 		{
 			insert(tabcount,$3.stringval,1,0);
+			if(tabcount==0)
+					fprintf(javacode,"\tfield static int %s\n",$3.stringval);
 			Trace("< LET MUT NAME reduce to variable >\n");
 		}
 		| LET MUT NAME ':' Type							// the declare variable ex: let mut a : int reduce to variable;
 		{
 			insert(tabcount,$3.stringval,$5.tokentype,1,0);
+			if(tabcount==0)
+			{
+				if($5.tokentype==0)
+					fprintf(javacode,"\tfield static int %s\n",$3.stringval);
+				else if($5.tokentype==4)
+					fprintf(javacode,"\tfield static bool %s\n",$3.stringval);
+			}
 			Trace("< LET MUT NAME ':' Type reduce to variable >\n");
 		}
 		;
@@ -447,10 +555,10 @@ array: LET MUT NAME '[' INT ',' NAME ']'				// the declare array ex: let mut a [
     |  LET MUT NAME '[' STR ',' int_expression ']'      {insertarray(tabcount,$3.stringval,3,$7.intval,1,"___"); Trace("< LET MUT NAME '[' STR ',' int_expression ']' reduce to array >\n");}
 	|  LET MUT NAME '[' BOOL ',' int_expression ']'     {insertarray(tabcount,$3.stringval,4,$7.intval,1,"___"); Trace("< LET MUT NAME '[' BOOL ',' int_expression ']' reduce to array >\n");}
     ;
-return: RETURN expression 	{Trace("< RETURN expression reduce to return >\n");}		// the function return ex: return 10 reduce to return;
-    |   RETURN 				{Trace("< RETURN reduce to return >\n");} 					// the function return ex: return reduce to return;
+return: RETURN expression 	{if(functionstatetype!=5)fprintf(javacode,"\t\tireturn\n\t}\n");else fprintf(javacode,"\t\treturn\n\t}\n");Trace("< RETURN expression reduce to return >\n");}		// the function return ex: return 10 reduce to return;
+    |   RETURN 				{if(functionstatetype!=5)fprintf(javacode,"\t\tireturn\n\t}\n");else fprintf(javacode,"\t\treturn\n\t}\n");Trace("< RETURN reduce to return >\n");} 					// the function return ex: return reduce to return;
     ;
-expression:string_expression 	{$$.tokentype=3;strcpy($$.stringval,$1.stringval);Trace("< string_expression reduce to expression >\n");}	// the string ex: "Hello world" reduce to string_expression;
+expression:string_expression 	{if(is_const!=1)fprintf(javacode,"\t\tldc \"%s\"\n",$1.stringval);$$.tokentype=3;strcpy($$.stringval,$1.stringval);Trace("< string_expression reduce to expression >\n");}	// the string ex: "Hello world" reduce to string_expression;
 		|  bool_expression 		{$$.tokentype=4;$$.boolval = $1.boolval;Trace("< bool_expression reduce to expression >\n");}				// the bool ex: true reduce to bool_expression;
 		|  expression '+' expression					// the add expression ex: 10+10 reduce to expression;
 		{
@@ -458,6 +566,7 @@ expression:string_expression 	{$$.tokentype=3;strcpy($$.stringval,$1.stringval);
 			{
 				$$.tokentype=0;
 				$$.intval = $1.intval+$3.intval;
+				fprintf(javacode,"\t\tiadd\n");
 			}
 			else if($1.tokentype==1&&$3.tokentype==0)
 			{
@@ -484,6 +593,7 @@ expression:string_expression 	{$$.tokentype=3;strcpy($$.stringval,$1.stringval);
 			{
 				$$.tokentype=0;
 				$$.intval = $1.intval-$3.intval;
+				fprintf(javacode,"\t\tisub\n");
 			}
 			else if($1.tokentype==1&&$3.tokentype==0)
 			{
@@ -510,6 +620,7 @@ expression:string_expression 	{$$.tokentype=3;strcpy($$.stringval,$1.stringval);
 			{
 				$$.tokentype=0;
 				$$.intval = $1.intval*$3.intval;
+				fprintf(javacode,"\t\timul\n");
 			}
 			else if($1.tokentype==1&&$3.tokentype==0)
 			{
@@ -536,6 +647,7 @@ expression:string_expression 	{$$.tokentype=3;strcpy($$.stringval,$1.stringval);
 			{
 				$$.tokentype=0;
 				$$.intval = $1.intval/$3.intval;
+				fprintf(javacode,"\t\tidiv\n");
 			}
 			else if($1.tokentype==1&&$3.tokentype==0)
 			{
@@ -562,6 +674,7 @@ expression:string_expression 	{$$.tokentype=3;strcpy($$.stringval,$1.stringval);
 			{
 				$$.tokentype = 0;
 				$$.intval = $1.intval % $3.intval;
+				fprintf(javacode,"\t\tirem\n");
 			}
 			else
 				yyerror("type error");
@@ -573,6 +686,7 @@ expression:string_expression 	{$$.tokentype=3;strcpy($$.stringval,$1.stringval);
 			{
 				$$.tokentype=0;
 				$$.intval = -$2.intval;
+				fprintf(javacode,"\t\tineg\n");
 			}
 			else if($2.tokentype==1)
 			{
@@ -609,7 +723,7 @@ expression:string_expression 	{$$.tokentype=3;strcpy($$.stringval,$1.stringval);
 				yyerror("type error");
 			Trace("< '(' expression ')' reduce to expression >\n");
 		}
-		| INTEGER {$$.intval = $1.intval;$$.tokentype=0; Trace("< INTEGER reduce to expression >\n");}
+		| INTEGER {$$.intval = $1.intval;$$.tokentype=0;if(is_local==1)if(is_const!=1)fprintf(javacode,"\t\tsipush %d\n",$1.intval); Trace("< INTEGER reduce to expression >\n");}
 		| Float {$$.floatval = $1.floatval;$$.tokentype=1; Trace("< FLOAT reduce to expression >\n");}
 		| NAME														// the id expression ex: a reduce to expression;
 		{
@@ -626,6 +740,17 @@ expression:string_expression 	{$$.tokentype=3;strcpy($$.stringval,$1.stringval);
 						break;
 				}
 				$$.intval = thetab[choose][index].theint;
+				symtab tempsym = returnsymbol($1.stringval);
+				if(tempsym.is_global==1)
+					fprintf(javacode,"\t\tgetstatic int proj3.%s\n",$1.stringval);
+				else
+				{
+					if(tempsym.thestate==1)
+						fprintf(javacode,"\t\tiload %d\n",tempsym.stackindex);
+					else
+						fprintf(javacode,"\t\tsipush %d\n",tempsym.theint);
+				}
+					
 			}
 			else if(returntype(tabcount,$1.stringval)==1)
 			{
@@ -665,6 +790,16 @@ expression:string_expression 	{$$.tokentype=3;strcpy($$.stringval,$1.stringval);
 						break;
 				}
 				$$.boolval = thetab[choose][index].thebool;
+				symtab tempsym = returnsymbol($1.stringval);
+				if(tempsym.is_global==1)
+					fprintf(javacode,"\t\tgetstatic bool proj3.%s\n",$1.stringval);
+				else
+				{
+					if(tempsym.thestate==1)
+						fprintf(javacode,"\t\tiload %d\n",tempsym.stackindex);
+					else
+						fprintf(javacode,"\t\ticonst_%d\n",tempsym.thebool);
+				}
 			}
 			else
 				yyerror("type error");
@@ -730,13 +865,41 @@ expression:string_expression 	{$$.tokentype=3;strcpy($$.stringval,$1.stringval);
 			Trace("< NAME '[' int_expression ']' reduce to expression >\n");
 		}
 		;
-if_statement: IF '(' bool_expression ')' block        				{Trace("< IF '(' bool_expression ')' lscope reduce to if_statement >\n");}
-		|     IF '(' bool_expression ')' statement             		{Trace("< IF '(' bool_expression ')' statement reduce to if_statement >\n");}
-		|	  IF '(' bool_expression ')' block ELSE block			{Trace("< IF '(' bool_expression ')' block ELSE block reduce to if_statement >\n");}
-		|	  IF '(' bool_expression ')' statement ELSE block		{Trace("< IF '(' bool_expression ')' statement ELSE block reduce to if_statement >\n");}
-		|	  IF '(' bool_expression ')' block ELSE	statement		{Trace("< IF '(' bool_expression ')' block ELSE statement reduce to if_statement >\n");}
-		|	  IF '(' bool_expression ')' statement ELSE statement	{Trace("< IF '(' bool_expression ')' statement ELSE statement reduce to if_statement >\n");}
-		;
+if_statement: IF '(' bool_expression ')'
+			  {
+				  label_stack[label_top++] = label_counter; // to prevent if block has other ifs , i must save the else or outside label
+				  fprintf(javacode,"\t\tifeq L%d\n",label_counter); // if bool_expression is not,it will jump to else or outside
+				  label_counter+=2;  // to prevent if block has other ifs, label+1 -> outside label , label+2 -> for next if or anothe condiction
+			  }
+			  else_statement   {Trace("< IF '(' bool_expression ')' else_statement reduce to if_statement >\n");}
+			  ;
+else_statement: block '}'   {fprintf(javacode,"\tL%d:\n",label_stack[--label_top]+1);}
+			|  	statement   {fprintf(javacode,"\tL%d:\n",label_stack[--label_top]+1);}
+			|  	block '}' ELSE
+			 	{
+					fprintf(javacode,"\t\tgoto L%d\n",label_stack[label_top-1]+1);  // go outside
+				  	fprintf(javacode,"\tL%d:\n",label_stack[label_top-1]);
+				}
+				block '}'  {fprintf(javacode,"\tL%d:\n",label_stack[--label_top]+1);}
+			|	statement ELSE
+				{
+					fprintf(javacode,"\t\tgoto L%d\n",label_stack[label_top-1]+1);  // go outside
+				  	fprintf(javacode,"\tL%d:\n",label_stack[label_top-1]);
+				}
+				block '}' {fprintf(javacode,"\tL%d:\n",label_stack[--label_top]+1);}
+			|	block '}' ELSE
+				{
+					fprintf(javacode,"\t\tgoto L%d\n",label_stack[label_top-1]+1);  // go outside
+				  	fprintf(javacode,"\tL%d:\n",label_stack[label_top-1]);
+				}
+				statement  {fprintf(javacode,"\tL%d:\n",label_stack[--label_top]+1);}
+			|	statement ELSE
+				{
+					fprintf(javacode,"\t\tgoto L%d\n",label_stack[label_top-1]+1);  // go outside
+				  	fprintf(javacode,"\tL%d:\n",label_stack[label_top-1]);
+				}
+				statement  {fprintf(javacode,"\tL%d:\n",label_stack[--label_top]+1);}
+			;
 bool_expression: expression EQ expression				// the bool check ex: a==b reduce to bool_expression;
 		{
 			$$.tokentype=4;
@@ -746,6 +909,13 @@ bool_expression: expression EQ expression				// the bool check ex: a==b reduce t
 					$$.boolval = true;
 				else
 					$$.boolval = false;
+				fprintf(javacode,"\t\tisub\n");
+				fprintf(javacode,"\t\tifeq L%d\n",label_counter);
+				fprintf(javacode,"\t\ticonst_0\n");
+				fprintf(javacode,"\t\tgoto L%d\n",label_counter+1);
+				fprintf(javacode,"\tL%d:\n\t\ticonst_1\n",label_counter);
+				fprintf(javacode,"\tL%d:\n",label_counter+1);
+				label_counter+=2;
 			}
 			else if($1.tokentype==0&&$3.tokentype==1)
 			{
@@ -781,6 +951,13 @@ bool_expression: expression EQ expression				// the bool check ex: a==b reduce t
 					$$.boolval = true;
 				else
 					$$.boolval = false;
+				fprintf(javacode,"\t\tisub\n");
+				fprintf(javacode,"\t\tifeq L%d\n",label_counter);
+				fprintf(javacode,"\t\ticonst_0\n");
+				fprintf(javacode,"\t\tgoto L%d\n",label_counter+1);
+				fprintf(javacode,"\tL%d:\n\t\ticonst_1\n",label_counter);
+				fprintf(javacode,"\tL%d:\n",label_counter+1);
+				label_counter+=2;
 			}
 			else
 				yyerror("type error");
@@ -795,6 +972,13 @@ bool_expression: expression EQ expression				// the bool check ex: a==b reduce t
 					$$.boolval = true;
 				else
 					$$.boolval = false;
+				fprintf(javacode,"\t\tisub\n");
+				fprintf(javacode,"\t\tifge L%d\n",label_counter);
+				fprintf(javacode,"\t\ticonst_0\n");
+				fprintf(javacode,"\t\tgoto L%d\n",label_counter+1);
+				fprintf(javacode,"\tL%d:\n\t\ticonst_1\n",label_counter);
+				fprintf(javacode,"\tL%d:\n",label_counter+1);
+				label_counter+=2;
 			}
 			else if($1.tokentype==0&&$3.tokentype==1)
 			{
@@ -823,6 +1007,13 @@ bool_expression: expression EQ expression				// the bool check ex: a==b reduce t
 					$$.boolval = true;
 				else
 					$$.boolval = false;
+				fprintf(javacode,"\t\tisub\n");
+				fprintf(javacode,"\t\tifge L%d\n",label_counter);
+				fprintf(javacode,"\t\ticonst_0\n");
+				fprintf(javacode,"\t\tgoto L%d\n",label_counter+1);
+				fprintf(javacode,"\tL%d:\n\t\ticonst_1\n",label_counter);
+				fprintf(javacode,"\tL%d:\n",label_counter+1);
+				label_counter+=2;
 			}
 			else
 				yyerror("type error");
@@ -837,6 +1028,13 @@ bool_expression: expression EQ expression				// the bool check ex: a==b reduce t
 					$$.boolval = true;
 				else
 					$$.boolval = false;
+				fprintf(javacode,"\t\tisub\n");
+				fprintf(javacode,"\t\tifle L%d\n",label_counter);
+				fprintf(javacode,"\t\ticonst_0\n");
+				fprintf(javacode,"\t\tgoto L%d\n",label_counter+1);
+				fprintf(javacode,"\tL%d:\n\t\ticonst_1\n",label_counter);
+				fprintf(javacode,"\tL%d:\n",label_counter+1);
+				label_counter+=2;
 			}
 			else if($1.tokentype==0&&$3.tokentype==1)
 			{
@@ -865,6 +1063,13 @@ bool_expression: expression EQ expression				// the bool check ex: a==b reduce t
 					$$.boolval = true;
 				else
 					$$.boolval = false;
+				fprintf(javacode,"\t\tisub\n");
+				fprintf(javacode,"\t\tifle L%d\n",label_counter);
+				fprintf(javacode,"\t\ticonst_0\n");
+				fprintf(javacode,"\t\tgoto L%d\n",label_counter+1);
+				fprintf(javacode,"\tL%d:\n\t\ticonst_1\n",label_counter);
+				fprintf(javacode,"\tL%d:\n",label_counter+1);
+				label_counter+=2;
 			}
 			else
 				yyerror("type error");
@@ -879,6 +1084,13 @@ bool_expression: expression EQ expression				// the bool check ex: a==b reduce t
 					$$.boolval = true;
 				else
 					$$.boolval = false;
+				fprintf(javacode,"\t\tisub\n");
+				fprintf(javacode,"\t\tifne L%d\n",label_counter);
+				fprintf(javacode,"\t\ticonst_0\n");
+				fprintf(javacode,"\t\tgoto L%d\n",label_counter+1);
+				fprintf(javacode,"\tL%d:\n\t\ticonst_1\n",label_counter);
+				fprintf(javacode,"\tL%d:\n",label_counter+1);
+				label_counter+=2;
 			}
 			else if($1.tokentype==0&&$3.tokentype==1)
 			{
@@ -914,6 +1126,13 @@ bool_expression: expression EQ expression				// the bool check ex: a==b reduce t
 					$$.boolval = true;
 				else
 					$$.boolval = false;
+				fprintf(javacode,"\t\tisub\n");
+				fprintf(javacode,"\t\tifne L%d\n",label_counter);
+				fprintf(javacode,"\t\ticonst_0\n");
+				fprintf(javacode,"\t\tgoto L%d\n",label_counter+1);
+				fprintf(javacode,"\tL%d:\n\t\ticonst_1\n",label_counter);
+				fprintf(javacode,"\tL%d:\n",label_counter+1);
+				label_counter+=2;
 			}
 			else
 				yyerror("type error");
@@ -928,6 +1147,13 @@ bool_expression: expression EQ expression				// the bool check ex: a==b reduce t
 					$$.boolval = true;
 				else
 					$$.boolval = false;
+				fprintf(javacode,"\t\tisub\n");
+				fprintf(javacode,"\t\tifgt L%d\n",label_counter);
+				fprintf(javacode,"\t\ticonst_0\n");
+				fprintf(javacode,"\t\tgoto L%d\n",label_counter+1);
+				fprintf(javacode,"\tL%d:\n\t\ticonst_1\n",label_counter);
+				fprintf(javacode,"\tL%d:\n",label_counter+1);
+				label_counter+=2;
 			}
 			else if($1.tokentype==0&&$3.tokentype==1)
 			{
@@ -956,6 +1182,13 @@ bool_expression: expression EQ expression				// the bool check ex: a==b reduce t
 					$$.boolval = true;
 				else
 					$$.boolval = false;
+				fprintf(javacode,"\t\tisub\n");
+				fprintf(javacode,"\t\tifgt L%d\n",label_counter);
+				fprintf(javacode,"\t\ticonst_0\n");
+				fprintf(javacode,"\t\tgoto L%d\n",label_counter+1);
+				fprintf(javacode,"\tL%d:\n\t\ticonst_1\n",label_counter);
+				fprintf(javacode,"\tL%d:\n",label_counter+1);
+				label_counter+=2;
 			}
 			else
 				yyerror("type error");
@@ -970,6 +1203,13 @@ bool_expression: expression EQ expression				// the bool check ex: a==b reduce t
 					$$.boolval = true;
 				else
 					$$.boolval = false;
+				fprintf(javacode,"\t\tisub\n");
+				fprintf(javacode,"\t\tiflt L%d\n",label_counter);
+				fprintf(javacode,"\t\ticonst_0\n");
+				fprintf(javacode,"\t\tgoto L%d\n",label_counter+1);
+				fprintf(javacode,"\tL%d:\n\t\ticonst_1\n",label_counter);
+				fprintf(javacode,"\tL%d:\n",label_counter+1);
+				label_counter+=2;
 			}
 			else if($1.tokentype==0&&$3.tokentype==1)
 			{
@@ -998,6 +1238,13 @@ bool_expression: expression EQ expression				// the bool check ex: a==b reduce t
 					$$.boolval = true;
 				else
 					$$.boolval = false;
+				fprintf(javacode,"\t\tisub\n");
+				fprintf(javacode,"\t\tiflt L%d\n",label_counter);
+				fprintf(javacode,"\t\ticonst_0\n");
+				fprintf(javacode,"\t\tgoto L%d\n",label_counter+1);
+				fprintf(javacode,"\tL%d:\n\t\ticonst_1\n",label_counter);
+				fprintf(javacode,"\tL%d:\n",label_counter+1);
+				label_counter+=2;
 			}
 			else
 				yyerror("type error");
@@ -1012,6 +1259,7 @@ bool_expression: expression EQ expression				// the bool check ex: a==b reduce t
 					$$.boolval = true;
 				else
 					$$.boolval = false;
+				fprintf(javacode,"\t\tiand\n");
 			}
 			else if($1.tokentype==0&&$3.tokentype==1)
 			{
@@ -1040,6 +1288,7 @@ bool_expression: expression EQ expression				// the bool check ex: a==b reduce t
 					$$.boolval = true;
 				else
 					$$.boolval = false;
+				fprintf(javacode,"\t\tiand\n");
 			}
 			else
 				yyerror("type error");
@@ -1054,6 +1303,7 @@ bool_expression: expression EQ expression				// the bool check ex: a==b reduce t
 					$$.boolval = true;
 				else
 					$$.boolval = false;
+				fprintf(javacode,"\t\tior\n");
 			}
 			else if($1.tokentype==0&&$3.tokentype==1)
 			{
@@ -1082,6 +1332,7 @@ bool_expression: expression EQ expression				// the bool check ex: a==b reduce t
 					$$.boolval = true;
 				else
 					$$.boolval = false;
+				fprintf(javacode,"\t\tior\n");
 			}
 			else
 				yyerror("type error");
@@ -1100,12 +1351,38 @@ bool_expression: expression EQ expression				// the bool check ex: a==b reduce t
 			}
 			Trace("< '!' expression reduce to bool_expression >\n");
 		}
-		|   TRUE 	{$$.tokentype=4;$$.boolval=true;Trace("< TRUE reduce to bool_expression >\n");}
-		|   FALSE 	{$$.tokentype=4;$$.boolval=false;Trace("< FALSE reduce to bool_expression >\n");}
+		|   TRUE 	{$$.tokentype=4;$$.boolval=true;fprintf(javacode,"\t\tsipush %d\n",1);Trace("< TRUE reduce to bool_expression >\n");}
+		|   FALSE 	{$$.tokentype=4;$$.boolval=false;fprintf(javacode,"\t\tsipush %d\n",0);Trace("< FALSE reduce to bool_expression >\n");}
 		;
-loop_statement:  WHILE '(' bool_expression ')' block 	{Trace("< WHILE '(' bool_expression ')' block reduece to loop_statement >\n");}
-		    |   WHILE '(' bool_expression ')' statement {Trace("< WHILE '(' bool_expression ')' statement reduce to loop_statement >\n");}
-		;
+loop_statement: WHILE
+				{
+					fprintf(javacode,"\tL%d:\n",label_counter);  // give the label for the start of while
+					label_stack[label_top++] = label_counter;   // to keep the start label of while for prevent the many whiles
+					label_counter++;
+				}
+				'(' bool_expression ')'
+				{
+					fprintf(javacode,"\t\tifeq L%d\n",label_counter);
+					label_stack[label_top++] = label_counter;   // to keep the end label of while for prevent the many whiles
+					label_counter++;
+				}
+				while_content  {Trace("< WHILE '(' bool_expression ')' while_content reduce to loop_statement >\n");}
+			;
+while_content:	block '}'
+				{
+					fprintf(javacode,"\t\tgoto L%d\n",label_stack[label_top-2]);  // go to the near start of while , label_top-1 -> end of while , label_top-2 ->start of while
+					fprintf(javacode,"\tL%d:\n",label_stack[--label_top]);  // for print the end label of while
+					label_top--;  // delete the inside while to become the outside while
+					Trace("< WHILE '(' bool_expression ')' block reduece to loop_statement >\n");
+				}
+			|	statement
+				{
+					fprintf(javacode,"\t\tgoto L%d\n",label_stack[label_top-2]);  // go to the near start of while , label_top-1 -> end of while , label_top-2 ->start of while
+					fprintf(javacode,"\tL%d:\n",label_stack[--label_top]);  // for print the end label of while
+					label_top--;  // delete the inside while to become the outside while
+					Trace("< WHILE '(' bool_expression ')' statement reduce to loop_statement >\n");
+				}
+			;
 Type: INT 		{$$.tokentype=0;Trace("< INT reduce to Type >\n");}			// the type statement to check what the type;
     | FLOAT 	{$$.tokentype=1;Trace("< FLOAT reduce to Type >\n");}
     | STR 		{$$.tokentype=3;Trace("< STR reduce to Type >\n");}
@@ -1141,7 +1418,7 @@ int_expression: int_expression '+' int_expression 	{$$.tokentype=0;$$.intval=$1.
 		Trace("< NAME reduce to int_expression >\n");
 	}
 	;
-function_return: NAME '(' argument ')'          // this block is to get function return value to variable and it reduces to function_return;
+function_return: NAME '(' function_invoke ')'          // this block is to get function return value to variable and it reduces to function_return;
 	{
 		int check = returnfunctiontype($1.stringval);
 		if(check==0)
@@ -1167,6 +1444,11 @@ function_return: NAME '(' argument ')'          // this block is to get function
 		}
 		else
 			yyerror("type error");
+		symtab tempfunction = returnfunctiontable($1.stringval);
+		if(tempfunction.thetype==0)
+			fprintf(javacode,"\t\tinvokestatic int proj3.%s(%s\n",$1.stringval,tempfunction.function_content.c_str());
+		else if(tempfunction.thetype==4)
+			fprintf(javacode,"\t\tinvokestatic bool proj3.%s(%s\n",$1.stringval,tempfunction.function_content.c_str());
 		Trace("< NAME '(' argument ')' reduce to function_return >\n");
 	}
 	|	NAME '(' ')'
@@ -1195,24 +1477,136 @@ function_return: NAME '(' argument ')'          // this block is to get function
 		}
 		else
 			yyerror("type error");
+		fprintf(javacode,"\t\tinvokestatic %d proj3.%s()\n",returnfunctiontype($1.stringval),$1.stringval);
 		Trace("NAME '(' ')' reduce to function_return >\n");
 	}
 	;
-function: FN NAME '(' argument ')' '-' '>' Type block     {argudump();$$.stringval=$2.stringval;insertfunction($2.stringval,$8.tokentype);Trace("< FN NAME '(' argument ')' '-' '>' Type block reduce to function >\n");} 		// this block is to declare the function and it reduecs to function;
-		| FN NAME '(' ')' '-' '>' Type block              {$$.stringval=$2.stringval;insertfunction($2.stringval,$7.tokentype);Trace("< FN NAME '(' ')' '-' '>' Type block reduce to function >\n");}
-		| FN NAME '(' argument ')' block                  {argudump();$$.stringval=$2.stringval;insertfunction($2.stringval,5);Trace("< FN NAME '(' argument ')' block reduce to function >\n");}
-		| FN NAME '(' ')' block                           {$$.stringval=$2.stringval;insertfunction($2.stringval,5);Trace("< FN NAME '(' ')' block reduce to function >\n");}
+function: FN NAME '(' arguments ')' '-' '>' Type      	// this block is to declare the function and it reduecs to function;
+		  {
+			is_local = 1;
+			functionstatetype = $8.tokentype;
+			if($8.tokentype==0)
+				fprintf(javacode,"\tmethod public static int %s(",$2.stringval);
+			else if($8.tokentype==4)
+				fprintf(javacode,"\tmethod public static int %s(",$2.stringval);
+			for(int i =0;i<totalargu;i++)
+			{
+				if(argu[i].thetype==0)
+				{
+					fprintf(javacode,"int");
+					temp_content +="int";
+				}	
+				else if(argu[i].thetype==4)
+				{
+					fprintf(javacode,"bool");
+					temp_content +="bool";
+				}	
+				if(i!=totalargu-1)
+				{
+					fprintf(javacode,", ");
+					temp_content += ", ";
+				}	
+				else
+				{
+					fprintf(javacode,")\n");
+					temp_content += ")";
+				}	
+			}
+			insertfunction($2.stringval,$8.tokentype);
+			temp_content="";
+			fprintf(javacode,"\tmax_stack 15\n");
+			fprintf(javacode,"\tmax_locals 15\n");
+			fprintf(javacode,"\t{\n");
+		  }
+		  function_block		{$$.stringval=$2.stringval;argudump();Trace("< FN NAME '(' argument ')' '-' '>' Type block reduce to function >\n");}
+		| FN NAME '(' ')' '-' '>' Type
+		  {
+			is_local = 1;
+			functionstatetype = $7.tokentype;
+			insertfunction($2.stringval,$7.tokentype);
+			if($7.tokentype==0)
+				fprintf(javacode,"\tmethod public static int %s()\n",$2.stringval);
+			else if($7.tokentype==4)
+				fprintf(javacode,"\tmethod public static int %s()\n",$2.stringval);
+			fprintf(javacode,"\tmax_stack 15\n");
+			fprintf(javacode,"\tmax_locals 15\n");
+			fprintf(javacode,"\t{\n");
+		  }
+		  function_block	{$$.stringval=$2.stringval;Trace("< FN NAME '(' ')' '-' '>' Type block reduce to function >\n");}
+		| FN NAME '(' arguments ')'
+		{
+			is_local = 1;
+			functionstatetype = 5;
+			fprintf(javacode,"\tmethod public static void %s(",$2.stringval);
+			for(int i =0;i<totalargu;i++)
+			{
+				if(argu[i].thetype==0)
+				{
+					fprintf(javacode,"int");
+					temp_content +="int";
+				}	
+				else if(argu[i].thetype==4)
+				{
+					fprintf(javacode,"bool");
+					temp_content +="bool";
+				}	
+				if(i!=totalargu-1)
+				{
+					fprintf(javacode,", ");
+					temp_content += ", ";
+				}	
+				else
+				{
+					fprintf(javacode,")\n");
+					temp_content += ")";
+				}	
+			}
+			insertfunction($2.stringval,5);
+			temp_content="";
+			fprintf(javacode,"\tmax_stack 15\n");
+			fprintf(javacode,"\tmax_locals 15\n");
+			fprintf(javacode,"\t{\n");
+		}
+		  function_block                 {$$.stringval=$2.stringval;argudump();Trace("< FN NAME '(' argument ')' block reduce to function >\n");}
+		| FN NAME '(' ')'
+		{
+			is_local = 1;
+			functionstatetype = 5;
+			insertfunction($2.stringval,5);
+			if(strcmp($2.stringval,"main")==0)
+			{
+				fprintf(javacode,"\tmethod public static void main(java.lang.String[])\n");
+				fprintf(javacode,"\tmax_stack 15\n");
+				fprintf(javacode,"\tmax_locals 15\n");
+				fprintf(javacode,"\t{\n");
+			}
+			else
+			{
+				fprintf(javacode,"\tmethod public static void %s()\n",$2.stringval);
+				fprintf(javacode,"\tmax_stack 15\n");
+				fprintf(javacode,"\tmax_locals 15\n");
+				fprintf(javacode,"\t{\n");
+			}
+		} 
+		  function_block                         {$$.stringval=$2.stringval;Trace("< FN NAME '(' ')' block reduce to function >\n");}
 		;
-argument: NAME ':' Type         				{if(totalargu==0)argu = (symargu*)malloc(sizeof(symargu)*10);insertargu($1.stringval,$3.tokentype); Trace("< NAME ':' Type reduce to argument >\n");} 			// this block is to declare the function argument and it reduces to argument;
-		| NAME ':' Type ',' argument            {insertargu($1.stringval,$3.tokentype);Trace("< NAME ':' Type ',' argument reduce to argument >\n");}
-		| argument ',' argument            		{Trace("< argument ',' argument reduce to argument >\n");}
-		| expression							{Trace(" <expression reduce to argument >\n");}
+function_block: block return ';' '}'			{is_local = 0;stackcount=0;Trace("< block return ';' '}' reduce to function_block >\n");}
+			|	block '}'						{is_local = 0;if(statecount==0)yyerror("no statement error");fprintf(javacode,"\t\treturn\n\t}\n");stackcount=0;Trace("< block '}' reduce to function_block >\n");}
+arguments: argument ',' arguments	{Trace("< argument ',' arguments reduce to arguments >\n");}
+		|  argument					{Trace("< argument reduce to arguments >\n");}
 		;
+argument: NAME ':' Type         	{if(totalargu==0){stackcount=0;argu = (symtab*)malloc(sizeof(symtab)*10);}insertargu($1.stringval,$3.tokentype); Trace("< NAME ':' Type reduce to argument >\n");} 			// this block is to declare the function argument and it reduces to argument;
+		;
+function_invoke: expression ',' function_invoke		{Trace("< expression ',' function_invoke reduce to function_invoke >\n");}
+			|	 expression							{Trace("< expression reduce to function_invoke >\n");}
+			; 
 %%
 //#include "lex.yy.c"
 int main()
 {
     thetab[0] = (symtab*)malloc(sizeof(symtab)*256);
+	javacode = fopen("B10415040.jasm","w");
+	fprintf(javacode,"class proj3\n{\n");
     /* open the source program file */
     /*if (argc != 2) {
 	printf ("Usage: sc filename\n");
@@ -1222,11 +1616,31 @@ int main()
     /* perform parsing */
     if (yyparse() == 1)                 /* parsing */
 	yyerror("Parsing error !");     /* syntax error */
+	fprintf(javacode,"}");
+	fclose(javacode);
     return 0;
 }
 void createtab(int tabcount)										// under this is to process the symbol table;
 {
 	thetab[tabcount] = (symtab*)malloc(sizeof(symtab)*256);
+}
+symtab returnsymbol(char *id)
+{
+	int choose = 0;
+	int index = 0;
+	for(int i =0;i<totalargu;i++)    // second to find the arguments
+	{
+		if(argu[i].name.compare(id)==0)
+			return argu[i];
+	}
+	for(int i =tabcount;i>=0;i--)    // first to find local variable
+	{
+		index = returnindex(i,id);
+		choose = i;
+		if(index!=-1)
+			return thetab[choose][index];
+	}
+	yyerror("No this variable");
 }
 void dump(int tabcount)
 {
@@ -1376,10 +1790,18 @@ void insert(int tabcount,char *id,int check,int array_check)
 	if(index==-1)
 	{
 		int push = idcount[tabcount];
+		if(tabcount==0)
+			thetab[tabcount][push].is_global = 1;
+		else
+			thetab[tabcount][push].is_global = 0;
 		thetab[tabcount][push].name=id;
+		if(check==1)
+			thetab[tabcount][push].stackindex = stackcount;
 		thetab[tabcount][push].thestate = check;
 		thetab[tabcount][push].array_or_not = array_check;
 		idcount[tabcount]++;
+		if(check==1)
+			stackcount++;
 	}
 	else
 	{
@@ -1389,21 +1811,37 @@ void insert(int tabcount,char *id,int check,int array_check)
 		{
 			if(returntype(tabcount,id)==0)
 			{
+				if(tabcount==0)
+					thetab[tabcount][index].is_global = 1;
+				else
+					thetab[tabcount][index].is_global = 0;
 				thetab[tabcount][index].thetype = 0;
 				thetab[tabcount][index].theint = 0;
 			}
 			else if(returntype(tabcount,id)==1)
 			{
+				if(tabcount==0)
+					thetab[tabcount][index].is_global = 1;
+				else
+					thetab[tabcount][index].is_global = 0;
 				thetab[tabcount][index].thetype = 1;
 				thetab[tabcount][index].thefloat = 0;
 			}
 			else if(returntype(tabcount,id)==3)
 			{
+				if(tabcount==0)
+					thetab[tabcount][index].is_global = 1;
+				else
+					thetab[tabcount][index].is_global = 0;
 				thetab[tabcount][index].thetype = 3;
 				thetab[tabcount][index].thestring="___";
 			}
 			else if(returntype(tabcount,id)==4)
 			{
+				if(tabcount==0)
+					thetab[tabcount][index].is_global = 1;
+				else
+					thetab[tabcount][index].is_global = 0;
 				thetab[tabcount][index].thetype = 4;
 				thetab[tabcount][index].thefloat = true;
 			}
@@ -1416,11 +1854,19 @@ void insert(int tabcount,char *id,int type,int check,int array_check)
 	if(index==-1)
 	{
 		int push = idcount[tabcount];
+		if(tabcount==0)
+			thetab[tabcount][push].is_global = 1;
+		else
+			thetab[tabcount][push].is_global = 0;
 		thetab[tabcount][push].name=id;
+		if(check==1)
+			thetab[tabcount][push].stackindex = stackcount;
 		thetab[tabcount][push].thetype = type;
 		thetab[tabcount][push].thestate = check;
 		thetab[tabcount][push].array_or_not = array_check;
 		idcount[tabcount]++;
+		if(check==1)
+			stackcount++;
 	}
 	else
 	{
@@ -1430,22 +1876,37 @@ void insert(int tabcount,char *id,int type,int check,int array_check)
 		{
 			if(returntype(tabcount,id)==0)
 			{
+				if(tabcount==0)
+					thetab[tabcount][index].is_global = 1;
+				else
+					thetab[tabcount][index].is_global = 0;
 				thetab[tabcount][index].thetype = type;
 				thetab[tabcount][index].theint = 0;
 			}
 			else if(returntype(tabcount,id)==1)
 			{
+				if(tabcount==0)
+					thetab[tabcount][index].is_global = 1;
+				else
+					thetab[tabcount][index].is_global = 0;
 				thetab[tabcount][index].thetype = type;
 				thetab[tabcount][index].thefloat = 0;
 			}
 			else if(returntype(tabcount,id)==3)
 			{
-				
+				if(tabcount==0)
+					thetab[tabcount][index].is_global = 1;
+				else
+					thetab[tabcount][index].is_global = 0;
 				thetab[tabcount][index].thetype = type;
 				thetab[tabcount][index].thestring = "___";
 			}
 			else if(returntype(tabcount,id)==4)
 			{
+				if(tabcount==0)
+					thetab[tabcount][index].is_global = 1;
+				else
+					thetab[tabcount][index].is_global = 0;
 				thetab[tabcount][index].thetype = type;
 				thetab[tabcount][index].thefloat = true;
 			}
@@ -1456,13 +1917,17 @@ void insertargu(string id,int type)
 {
 	argu[totalargu].name = id;
 	argu[totalargu].thetype = type;
+	argu[totalargu].stackindex = stackcount;
+	argu[totalargu].is_global = 0;
 	totalargu++;
+	stackcount++;
 }
 void insertfunction(char *id,int type)
 {
 	int push = functioncount;
 	funtab[push].name = id;
 	funtab[push].thetype = type;
+	funtab[push].function_content = temp_content;
 	functioncount++;
 	if(type==0)
 		funtab[push].theint = 0;
@@ -1472,7 +1937,6 @@ void insertfunction(char *id,int type)
 		funtab[push].thestring = "___";
 	else if(type==4)
 	 	funtab[push].thebool =false;
-	
 	else if(type==5)
 	{
 		funtab[push].theint = 0;
@@ -1516,6 +1980,14 @@ int returnfunctiontype(char *id)
 			yyerror("function not in function table error");
 	}
 	return funtab[choose].thetype;
+}
+symtab returnfunctiontable(char *id)
+{
+	for(int i =0;i<functioncount;i++)
+	{
+		if(funtab[i].name.compare(id)==0)
+			return funtab[i];
+	}
 }
 int return_constant_or_variable(int tabcount,char *id)
 {
